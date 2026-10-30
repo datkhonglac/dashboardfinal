@@ -595,10 +595,6 @@ def sidebar(res):
         for k, lab, ic, _ in NAV:
             st.button(lab, icon=ic, key=f"nav_{k}", type="primary" if k == cur else "secondary", width="stretch",
                       on_click=lambda k=k: st.session_state.update(nav=k))
-        team = f"<b>{e(TEAM_NAME)}</b><br>" if TEAM_NAME else ""
-        info = (f"Đang xem: <b>{e(res['source'])}</b><br>Mô hình {e(F.VERSION.split(' ')[0])} · ngưỡng "
-                f"{d(res['report']['threshold'], 4)}<br>") if res is not None else ""
-        H(f'<div class="fs fs-sidefoot">{team}{info}Festival Chuyển đổi số 2026<br>Bảng B · Digital Payment Fraud Shield</div>')
     return cur
 
 
@@ -676,14 +672,13 @@ def page_overview(res):
                           margin=dict(l=6, r=10, t=8, b=6))
         chart(fig, "ov_pie")
     with c2, card("ov_prf"):
-        title("Khả năng phát hiện và độ chính xác", "Kiểm định chéo 5-fold trên giao dịch có nhãn · đường chấm: mục tiêu Recall 0,80")
+        title("Khả năng phát hiện và độ chính xác")
         if train:
             names, vals, cols = ["Precision", "Recall", "F1-score", "PR-AUC"], \
                 [b["precision"], b["recall"], b["f1"], b["pr_auc"]], [BLUE, "#3B7DDD", TEAL, PURPLE]
             fig = go.Figure(go.Bar(x=names, y=vals, marker_color=cols, text=[d(v) for v in vals], textposition="outside",
                                    cliponaxis=False, width=0.55, hovertemplate="%{x}: %{text}<extra></extra>",
                                    textfont=dict(size=14, color=INK)))
-            fig.add_hline(y=0.8, line=dict(color="#94A3B8", dash="dot", width=1.2))
             style(fig, 300, legend=False)
             fig.update_yaxes(range=[0, 1.12], tickformat=".1f", dtick=0.2)
             chart(fig, "ov_prf")
@@ -1390,5 +1385,3 @@ elif RES is None:
     no_data()
 else:
     PAGES[cur](RES)
-H(f"""<div class="fs fs-foot"><span>* Cảnh báo không đồng nghĩa với kết luận gian lận – quyết định cuối cùng thuộc chuyên viên.
-  Dữ liệu tải lên chỉ xử lý trong phiên.</span><span>{e(F.VERSION)} · Festival Chuyển đổi số 2026 · Bảng B</span></div>""")
