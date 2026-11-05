@@ -16,9 +16,17 @@ from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
-from sklearn.ensemble._iforest import _average_path_length
-
 import fraud_core as F
+
+
+def _average_path_length(n):
+    """Độ dài đường đi trung bình c(n) của Isolation Forest (cùng công thức với scikit-learn)."""
+    n = np.asarray(n, dtype=float)
+    out = np.zeros_like(n)
+    out[n == 2] = 1.0
+    m = n > 2
+    out[m] = 2.0 * (np.log(n[m] - 1.0) + np.euler_gamma) - 2.0 * (n[m] - 1.0) / n[m]
+    return out
 
 ACTIONS = {"CRITICAL": "Tạm dừng giao dịch, gọi xác minh ngay",
            "HIGH": "Tạm dừng, chuyên viên kiểm tra trong ca",
