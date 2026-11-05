@@ -241,9 +241,6 @@ display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px}
 </style>
 """
 st.markdown(re.sub(r"\s*\n\s*", " ", CSS), unsafe_allow_html=True)
-if not st.get_option("theme.primaryColor"):
-    st.warning("Thiếu tệp .streamlit/config.toml trong repo nên màu giao diện chưa đúng – hãy tải cả thư mục "
-               ".streamlit lên GitHub (xem README).", icon=":material/palette:")
 
 
 # ----------------------------------------------------------------------------- tiện ích hiển thị
