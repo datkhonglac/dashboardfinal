@@ -6,7 +6,8 @@ Chạy trên máy:   streamlit run streamlit_app.py
 Triển khai:      Streamlit Community Cloud – chọn tệp chính là streamlit_app.py
 Lõi mô hình:     fraud_core.py (giống hệt pipeline trong hồ sơ dự thi)
 
-Giao diện 5 màn hình: Tổng quan · Giao dịch · Hồ sơ cảnh báo · Kiểm định · Dữ liệu & Chạy mô hình
+Phiên bản v3.1 – 6 màn hình: Hàng đợi của tôi · Luồng thời gian thực · Tổng quan · Giao dịch · Kiểm định ·
+Dữ liệu & Quản trị. Chấm điểm thời gian thực: fs_realtime.py (trùng 100% với chấm theo lô).
 """
 import hashlib
 import html
@@ -28,6 +29,7 @@ import streamlit as st
 from sklearn.metrics import precision_recall_curve
 
 import fraud_core as F
+import fs_realtime as RT
 
 # ----------------------------------------------------------------------------- cấu hình chung
 TEAM_NAME = ""  # điền tên đội, ví dụ "Đội ABC" – để trống thì không hiển thị
@@ -42,12 +44,19 @@ DECISIONS = ["Xác nhận gian lận", "Báo động giả", "Cần thêm thông
 STATUSES = ["Chưa xử lý", "Đang xác minh", "Xác nhận gian lận", "Báo động giả"]
 STATUS_COLOR = {"Chưa xử lý": "#F03E3E", "Đang xác minh": "#1C7ED6", "Xác nhận gian lận": "#862E9C",
                 "Báo động giả": "#2F9E44", "Theo dõi": "#F59F00", "Bình thường": "#12B886",
-                "Xử lý một phần": "#1C7ED6", "Đã xử lý": "#2F9E44"}
+                "Xử lý một phần": "#1C7ED6", "Đã xử lý": "#2F9E44", "Xác thực thêm": "#F59F00",
+                "Nghi vấn mẫu mới": "#7048E8"}
 DONE = ("Xác nhận gian lận", "Báo động giả")
-LEVEL_INFO = {"CRITICAL": ("Khẩn cấp", "Tạm dừng, gọi xác minh ngay"),
-              "HIGH": ("Cao", "Kiểm tra trong ca"),
-              "MEDIUM": ("Theo dõi", "Không chặn, đưa vào danh sách theo dõi"),
-              "LOW": ("Bình thường", "Không can thiệp")}
+LEVEL_INFO = {"CRITICAL": ("Khẩn cấp", "Tạm dừng giao dịch, gọi xác minh ngay · SLA 5 phút"),
+              "HIGH": ("Cao", "Tạm dừng, chuyên viên kiểm tra · SLA 2 giờ"),
+              "MEDIUM": ("Xác thực thêm", "Không chặn, tự động yêu cầu OTP/sinh trắc học"),
+              "LOW": ("Bình thường", "Cho qua")}
+ACTION_SHORT = {"CRITICAL": "Tạm dừng", "HIGH": "Tạm dừng", "MEDIUM": "Xác thực thêm", "LOW": "Cho qua"}
+SLA_S = {"CRITICAL": 300, "HIGH": 7200}
+SLA_TXT = {"CRITICAL": "5 phút", "HIGH": "2 giờ"}
+SIM_ACTIONS = [("lock", "Tạm khóa thiết bị", ":material/phonelink_lock:"),
+               ("bio", "Yêu cầu xác thực sinh trắc học", ":material/fingerprint:"),
+               ("sms", "Gửi thông báo cho khách", ":material/sms:")]
 DEC2STATUS = {"Xác nhận gian lận": "Xác nhận gian lận", "Xác nhận rủi ro": "Xác nhận gian lận",
               "Báo động giả": "Báo động giả", "Cần thêm thông tin": "Đang xác minh"}
 DB_PATH = Path(tempfile.gettempdir()) / "fraudshield_decisions.sqlite"
@@ -62,11 +71,12 @@ TYPE_ORDER = list(dict.fromkeys([t for _, t in RISK_TYPES] + [OTHER_TYPE]))
 FRAUD_VN = {"FAILED_THEN_SUCCESS": "Thử sai rồi thành công", "VELOCITY_BURST": "Giao dịch dồn dập",
             "AMOUNT_SPIKE": "Số tiền tăng vọt", "NEW_DEVICE": "Thiết bị mới",
             "LOCATION_ANOMALY": "Nơi lạ, IP nước ngoài", "HIGH_RISK_MERCHANT": "Merchant rủi ro cao"}
-NAV = [("overview", "Tổng quan", ":material/space_dashboard:", "Tổng quan kết quả phát hiện rủi ro"),
-       ("tx", "Giao dịch", ":material/payments:", "Danh sách giao dịch"),
-       ("cases", "Hồ sơ cảnh báo", ":material/warning:", "Quản lý hồ sơ cảnh báo"),
+NAV = [("cases", "Hàng đợi của tôi", ":material/inbox:", "Hàng đợi hồ sơ cần xử lý"),
+       ("live", "Luồng thời gian thực", ":material/bolt:", "Giám sát giao dịch theo thời gian thực"),
+       ("overview", "Tổng quan", ":material/space_dashboard:", "Tổng quan kết quả phát hiện rủi ro"),
+       ("tx", "Giao dịch", ":material/payments:", "Tra cứu giao dịch"),
        ("eval", "Kiểm định", ":material/verified_user:", "Kết quả kiểm định mô hình"),
-       ("data", "Dữ liệu & Chạy mô hình", ":material/database:", "Nhập dữ liệu và chạy mô hình")]
+       ("data", "Dữ liệu & Quản trị", ":material/database:", "Dữ liệu, chạy mô hình và học lại có kiểm soát")]
 
 st.set_page_config(page_title="Fraud Shield · Digital Payment Risk Console", page_icon="🛡️",
                    layout="wide", initial_sidebar_state="expanded")
@@ -347,7 +357,35 @@ def _db():
     con = sqlite3.connect(DB_PATH, timeout=10)
     con.execute("CREATE TABLE IF NOT EXISTS decisions (ds TEXT, transaction_id TEXT, case_id TEXT, decision TEXT, "
                 "note TEXT, user TEXT, time TEXT, model TEXT, threshold REAL)")
+    con.execute("CREATE TABLE IF NOT EXISTS actions (ds TEXT, case_id TEXT, target TEXT, action TEXT, user TEXT, time TEXT)")
     return con
+
+
+def save_action(ds, case_id, target, action, user="chuyên viên"):
+    """Tác vụ nghiệp vụ MÔ PHỎNG (tạm khóa thiết bị, yêu cầu sinh trắc học, gửi thông báo) – chỉ ghi nhật ký."""
+    with closing(_db()) as con:
+        con.execute("INSERT INTO actions VALUES (?,?,?,?,?,?)", (ds, case_id, target, action, user, now_vn()))
+        con.commit()
+
+
+def load_actions(ds):
+    try:
+        with closing(_db()) as con:
+            return pd.read_sql_query("SELECT case_id, target, action, user, time FROM actions WHERE ds = ? ORDER BY rowid",
+                                     con, params=(ds,))
+    except Exception:  # noqa
+        return pd.DataFrame(columns=["case_id", "target", "action", "user", "time"])
+
+
+def analyst_labels(ds):
+    """Nhãn do chuyên viên kết luận (kết luận mới nhất của từng giao dịch): gian lận = 1, báo động giả = 0."""
+    lg = load_log(ds)
+    if lg.empty:
+        return pd.DataFrame(columns=["transaction_id", "is_fraud"])
+    last = lg.drop_duplicates("transaction_id", keep="last")
+    last = last[last.decision.isin(["Xác nhận gian lận", "Báo động giả"])]
+    return pd.DataFrame({"transaction_id": last.transaction_id.values,
+                         "is_fraud": (last.decision == "Xác nhận gian lận").astype(int).values})
 
 
 def save_decisions(ds, rows):
@@ -370,6 +408,7 @@ def load_log(ds):
 def clear_decisions(ds):
     with closing(_db()) as con:
         con.execute("DELETE FROM decisions WHERE ds = ?", (ds,))
+        con.execute("DELETE FROM actions WHERE ds = ?", (ds,))
         con.commit()
 
 
@@ -408,12 +447,12 @@ def status_frame(res):
 
 # ----------------------------------------------------------------------------- chạy mô hình (có cache)
 @st.cache_data(show_spinner=False, max_entries=8, ttl=6 * 3600)
-def engine(files: dict):
+def engine(files: dict, extra=None):
     t0 = time.perf_counter()
     tables, checks, ok = F.validate(files)
     if not ok:
         return {"ok": False, "checks": checks}
-    res = F.run(files, tables=tables)
+    res = F.run(files, tables=tables, extra_labels=extra)
     res.update(ok=True, checks=checks, seconds=round(time.perf_counter() - t0, 1))
     return res
 
@@ -423,10 +462,12 @@ def sample_files():
     return F.collect_dir(SAMPLE_DIR)
 
 
-def store_result(res, files, notes, source):
+def store_result(res, files, notes, source, label=None):
     checks = [{"group": "Tệp tải lên", "check": n, "status": "CẢNH BÁO", "detail": ""} for n in notes] + res["checks"]
     ds = hashlib.sha1(files.get("transactions.csv", b"")).hexdigest()[:16]
+    st.session_state.files = files
     st.session_state.res = {**res, "checks": checks, "source": source, "ds": ds,
+                            "version_label": label or "Bản gốc (nhãn BTC)",
                             "started": datetime.now(VN_TZ).strftime("%d/%m/%Y %H:%M"),
                             "size": sum(len(v) for v in files.values() if isinstance(v, (bytes, bytearray))),
                             "rid": f"{abs(hash((source, time.time()))) % 10**8:08d}"}
@@ -437,7 +478,7 @@ def start_run(files, notes, source):
     with st.status("Đang chạy Fraud Shield…", expanded=True) as s:
         st.write("Kiểm tra cấu trúc tệp, đối chiếu manifest và SHA-256")
         st.write("Dựng hồ sơ hành vi, chấm điểm Rule – Logistic Regression – Isolation Forest")
-        st.write("Huấn luyện/đánh giá 5-fold (nếu có nhãn), xếp hạng và gom case")
+        st.write("Huấn luyện/đánh giá 5-fold (nếu có nhãn), 3 tầng hành động, thí nghiệm ẩn từng kiểu, gom hồ sơ")
         try:
             res = engine(files)
         except Exception as ex:  # noqa
@@ -481,13 +522,23 @@ def profile_of(df, cust, exclude_ids):
     return hist, {k: top(k) for k in ["device_id", "location", "ip_country", "payment_channel"]}
 
 
-def network(tx, cust):
+def network(tx, cust, df=None):
+    """Sơ đồ liên kết đa khách hàng: khách hàng của hồ sơ – thiết bị – merchant, kèm các khách hàng KHÁC đã dùng
+    chung thiết bị (dấu hiệu số 8, Phụ lục 02 TT 17/2024 sửa đổi bởi TT 25/2025)."""
     devs = tx.groupby("device_id").agg(n=("transaction_id", "size"), reg=("registered_customer_id", "first"),
                                         risk=("device_risk_level", "first")).reset_index()
     mers = tx.groupby("merchant_id").agg(n=("transaction_id", "size"), cat=("merchant_category", "first"),
                                           risk=("merchant_risk_level", "first")).reset_index()
+    others = []
+    if df is not None:
+        o = df[df.device_id.isin(devs.device_id) & (df.customer_id != cust)]
+        others = (o.groupby(["customer_id", "device_id"]).size().reset_index(name="n")).itertuples()
+        others = list(others)
     ys = lambda k: np.linspace(0, 1, k + 2)[1:-1] if k > 1 else np.array([0.5])  # noqa: E731
-    pos = {("c", cust): (0, 0.5)}
+    custs = [cust] + sorted({r.customer_id for r in others})
+    pos = {}
+    for y, c in zip(ys(len(custs)), custs):
+        pos[("c", c)] = (0, y)
     for y, r in zip(ys(len(devs)), devs.itertuples()):
         pos[("d", r.device_id)] = (1, y)
     for y, r in zip(ys(len(mers)), mers.itertuples()):
@@ -498,27 +549,41 @@ def network(tx, cust):
         for a, b in [(("c", cust), ("d", r.device_id)), (("d", r.device_id), ("m", r.merchant_id))]:
             ex += [pos[a][0], pos[b][0], None]; ey += [pos[a][1], pos[b][1], None]
     fig.add_scatter(x=ex, y=ey, mode="lines", line=dict(color="#C5CEDC", width=1.6), hoverinfo="skip")
-    nodes = [(pos[("c", cust)], cust, NAVY, f"Khách hàng {cust}")]
+    if others:
+        ox, oy = [], []
+        for r in others:
+            a, b = ("c", r.customer_id), ("d", r.device_id)
+            ox += [pos[a][0], pos[b][0], None]; oy += [pos[a][1], pos[b][1], None]
+        fig.add_scatter(x=ox, y=oy, mode="lines", line=dict(color=LEVEL_COLOR["HIGH"], width=1.6, dash="dot"),
+                        hoverinfo="skip")
+    nodes = [(pos[("c", cust)], cust, NAVY, f"Khách hàng {cust} (hồ sơ này)", 30)]
+    seen = set()
+    for r in others:
+        if r.customer_id in seen:
+            continue
+        seen.add(r.customer_id)
+        k = sum(x.n for x in others if x.customer_id == r.customer_id)
+        nodes.append((pos[("c", r.customer_id)], r.customer_id, LEVEL_COLOR["HIGH"],
+                      f"Khách hàng khác {r.customer_id}<br>dùng chung thiết bị · {k} giao dịch", 22))
     for r in devs.itertuples():
         own = str(r.reg) == str(cust)
         col = "#2B8A3E" if own else LEVEL_COLOR["CRITICAL"]
         nodes.append((pos[("d", r.device_id)], r.device_id, col,
                       f"Thiết bị {r.device_id}<br>{'Đăng ký cho khách này' if own else 'Không đăng ký cho khách này'}"
-                      f"<br>Rủi ro nền {r.risk} · {r.n} giao dịch"))
+                      f"<br>Rủi ro nền {r.risk} · {r.n} giao dịch trong hồ sơ", 22))
     for r in mers.itertuples():
         nodes.append((pos[("m", r.merchant_id)], r.merchant_id, LEVEL_COLOR.get(r.risk, "#2557D6") if r.risk != "LOW" else BLUE,
-                      f"Merchant {r.merchant_id}<br>{r.cat} · rủi ro {r.risk}<br>{r.n} giao dịch"))
+                      f"Merchant {r.merchant_id}<br>{r.cat} · rủi ro {r.risk}<br>{r.n} giao dịch", 22))
     fig.add_scatter(x=[p[0][0] for p in nodes], y=[p[0][1] for p in nodes], mode="markers+text",
-                    marker=dict(size=[30] + [22] * (len(nodes) - 1), color=[p[2] for p in nodes],
-                                line=dict(color="#fff", width=2)),
+                    marker=dict(size=[p[4] for p in nodes], color=[p[2] for p in nodes], line=dict(color="#fff", width=2)),
                     text=[p[1] for p in nodes], textposition="bottom center", textfont=dict(size=11, color="#334155"),
                     hovertext=[p[3] for p in nodes], hovertemplate="%{hovertext}<extra></extra>")
-    style(fig, 260, legend=False)
+    style(fig, 280 if len(custs) <= 3 else 340, legend=False)
     fig.update_xaxes(visible=False, range=[-0.35, 2.35])
     fig.update_yaxes(visible=False, range=[-0.15, 1.1])
     for x, t in [(0, "Khách hàng"), (1, "Thiết bị"), (2, "Merchant")]:
         fig.add_annotation(x=x, y=1.08, text=f"<b>{t}</b>", showarrow=False, font=dict(size=11.5, color=MUTED))
-    return fig
+    return fig, len(custs) - 1
 
 
 FIELD_LABELS = {"customer_id": "Khách hàng", "customer_segment": "Phân khúc", "home_location": "Nơi ở",
@@ -588,7 +653,7 @@ def topbar(res, page_title):
 
 
 def sidebar(res):
-    cur = st.session_state.get("nav", "overview")
+    cur = st.session_state.get("nav", "cases")
     with st.sidebar:
         H(f'<div class="fs fs-brand">{SHIELD.format(w=44)}<div><div class="nm">Fraud Shield</div>'
           f'<div class="sb">Digital Payment Risk Console</div></div></div>')
@@ -648,13 +713,33 @@ def page_overview(res):
     open_cases = int((cs != "Đã xử lý").sum())
     train = res["mode"] == "train"
     b = rep["comparison_nested_cv"]["Gộp 3 tầng – có hồ sơ (B, chính thức)"] if train else None
+    n_step = int(rep.get("n_stepup", (df.risk_level == "MEDIUM").sum()))
+    k = rep.get("kpi") if train else None
     kgrid([
         kcard(n0(n), "Giao dịch đã chấm điểm", BLUE, f"{df.datetime.min():%d/%m/%Y} – {df.datetime.max():%d/%m/%Y}"),
-        kcard(n0(n_alert), "Giao dịch cảnh báo", LEVEL_COLOR["CRITICAL"], "Mức CRITICAL + HIGH", pct(n_alert / n), "#FFE3E3"),
-        kcard(n0(len(res["cases"])), "Hồ sơ cần xem xét", LEVEL_COLOR["HIGH"], f"{n0(open_cases)} hồ sơ chưa xử lý xong",
-              f"−{pct(rep.get('case_reduction', 0), 0)}", "#FFE8CC"),
-        kcard(d(b["f1"]), "F1-score", GREEN, "Mục tiêu ≥ 0,75 · kiểm định 5-fold", "Đạt" if b["f1"] >= .75 else "Chưa đạt",
-              "#E6F4EA") if train else kcard("–", "F1-score", GREEN, "Cần tệp nhãn để đánh giá")])
+        kcard(n0(n_alert), "Tạm dừng giao dịch", LEVEL_COLOR["CRITICAL"],
+              f"CRITICAL + HIGH · gom thành {n0(len(res['cases']))} hồ sơ ({n0(open_cases)} chưa xử lý xong)",
+              pct(n_alert / n), "#FFE3E3"),
+        kcard(n0(n_step), "Yêu cầu xác thực thêm", LEVEL_COLOR["MEDIUM"], "MEDIUM · không chặn, hỏi OTP/sinh trắc học",
+              pct(n_step / n), "#FFF3BF"),
+        kcard(d(k["intervene_recall"]), "Recall can thiệp", GREEN,
+              f"{k['intervene_tp']}/{k['n_fraud']} gian lận bị chặn hoặc phải xác thực thêm · kiểm định 5-fold",
+              "Đạt ≥ 0,90" if k["intervene_recall"] >= .9 else "Chưa đạt 0,90", "#E6F4EA")
+        if k else kcard("–", "Recall can thiệp", GREEN, "Cần tệp nhãn để đánh giá")])
+    if k:
+        with card("ov_kpi"):
+            title("Bộ chỉ số 3 tầng hành động",
+                  "Kiểm định 5-fold, ngưỡng chọn trên phần huấn luyện của từng fold · chỉ dùng dữ liệu quá khứ")
+            H('<div class="fs fs-kgrid" style="margin:4px 0 4px">' + "".join([
+                kcard(pct(k["intervene_recall"]), "Can thiệp (chặn hoặc xác thực thêm)", GREEN,
+                      f"đổi lại {pct(k['stepup_legit_rate'], 2)} khách thật phải xác thực thêm vài giây"),
+                kcard(pct(k["value_recall_hard"]), "Giá trị tiền gian lận bị chặn", BLUE,
+                      f"{pct(k['value_recall_intervene'])} nếu tính cả xác thực thêm"),
+                kcard(pct(k["case_recall"]), "Vụ tấn công bị phát hiện", PURPLE,
+                      f"{k['attacks_detected']}/{k['n_attacks']} vụ có ít nhất 1 giao dịch bị chặn ngay"),
+                kcard(pct(k["hard_recall"]), "Chặn ngay tại thời điểm giao dịch", LEVEL_COLOR["HIGH"],
+                      f"{k['hard_tp']}/{k['n_fraud']} gian lận · {k['hard_fp']} báo nhầm / {n0(k['n_legit'])} giao dịch thật")])
+              + "</div>")
 
     c1, c2 = st.columns([1, 1], gap="medium")
     with c1, card("ov_donut"):
@@ -672,7 +757,7 @@ def page_overview(res):
                           margin=dict(l=6, r=10, t=8, b=6))
         chart(fig, "ov_pie")
     with c2, card("ov_prf"):
-        title("Khả năng phát hiện và độ chính xác")
+        title("Khả năng phát hiện ở mức chặn (HIGH/CRITICAL)")
         if train:
             names, vals, cols = ["Precision", "Recall", "F1-score", "PR-AUC"], \
                 [b["precision"], b["recall"], b["f1"], b["pr_auc"]], [BLUE, "#3B7DDD", TEAL, PURPLE]
@@ -739,17 +824,59 @@ def page_overview(res):
                 f'<div class="fs-mini"><span class="id">{e(r.case_id)}</span>{badge(r.case_level)}'
                 f'<span class="why">{e(r.customer_id)} · {int(r.n_transactions)} GD · {e(str(r.top_reason).split(";")[0])}</span>'
                 f'<b>{d(r.max_risk_score, 4)}</b></div>' for r in top.itertuples()) + "</div>")
-            st.button("Mở hàng đợi hồ sơ", icon=":material/arrow_forward:", key="ov_go_cases",
+            st.button("Mở hàng đợi của tôi", icon=":material/arrow_forward:", key="ov_go_cases",
                       on_click=lambda: st.session_state.update(nav="cases"))
 
 
 # ============================================================================= 2. GIAO DỊCH
 def tx_status(res):
     df = res["df"]
-    s = pd.Series(np.where(df.risk_level == "MEDIUM", "Theo dõi", "Bình thường"), index=df.transaction_id.values)
+    nov = df["novelty"].values == 1 if "novelty" in df else np.zeros(len(df), dtype=bool)
+    s = pd.Series(np.where(df.risk_level == "MEDIUM", "Xác thực thêm", np.where(nov, "Nghi vấn mẫu mới", "Bình thường")),
+                  index=df.transaction_id.values)
     a = status_frame(res)
     s.loc[a.transaction_id.values] = a.status.values
     return s
+
+
+RULE_SHORT = {k: v.split(" – ")[0] for k, v in F.RULE_NAMES.items()}
+
+
+def advanced_filters(df, rid):
+    """Bộ lọc đa chiều (ẩn trong ngăn kéo) – trả về bộ lọc dạng tuple để làm chữ ký phân trang."""
+    rl = st.multiselect("Luật đã bật (giao dịch phải bật tất cả)", list(F.RULE_W), format_func=lambda k: F.RULE_NAMES[k],
+                        key=f"adv_rules_{rid}")
+    no_rule = st.toggle("Chỉ giao dịch không bật luật chính nào nhưng điểm học máy cao (≥ 0,5)", key=f"adv_norule_{rid}")
+    c = st.columns(2)
+    amin = c[0].number_input("Số tiền từ (VND)", min_value=0, value=0, step=500000, key=f"adv_amin_{rid}")
+    amax = c[1].number_input("đến (VND, 0 = không giới hạn)", min_value=0, value=0, step=500000, key=f"adv_amax_{rid}")
+    ratio = st.slider("Gấp mức nền của khách ít nhất", 0.0, 10.0, 0.0, 0.5, key=f"adv_ratio_{rid}")
+    hours = st.slider("Khung giờ", 0, 23, (0, 23), key=f"adv_hour_{rid}")
+    ips = st.multiselect("Quốc gia IP", sorted(df.ip_country.astype(str).unique()), key=f"adv_ip_{rid}")
+    dev = st.slider("Số chiều lệch thói quen ít nhất", 0, 5, 0, key=f"adv_dev_{rid}")
+    return (tuple(rl), no_rule, int(amin), int(amax), float(ratio), tuple(hours), tuple(ips), int(dev))
+
+
+def apply_advanced(v, adv):
+    rl, no_rule, amin, amax, ratio, hours, ips, dev = adv
+    for k in rl:
+        v = v[v[k] == 1]
+    if no_rule:
+        main = ["flag_R1_strong", "flag_R2", "flag_R3", "flag_R4", "flag_R5", "flag_R6", "flag_R7"]
+        v = v[(v[main].sum(axis=1) == 0) & (v.ml_score >= 0.5)]
+    if amin:
+        v = v[v.amount >= amin]
+    if amax:
+        v = v[v.amount <= amax]
+    if ratio:
+        v = v[v.amt_ratio >= ratio]
+    if tuple(hours) != (0, 23):
+        v = v[v.datetime.dt.hour.between(hours[0], hours[1])]
+    if ips:
+        v = v[v.ip_country.astype(str).isin(ips)]
+    if dev:
+        v = v[v.profile_dev_count >= dev]
+    return v
 
 
 def page_tx(res):
@@ -759,15 +886,19 @@ def page_tx(res):
     with card("tx_filter"):
         c = st.columns([1, 1, 1, 1, 1], vertical_alignment="bottom")
         lv = c[0].selectbox("Mức rủi ro", ["Tất cả"] + LEVELS, key=f"tx_lv_{rid}")
-        stv = c[1].selectbox("Trạng thái", ["Tất cả"] + STATUSES + ["Theo dõi", "Bình thường"], key=f"tx_st_{rid}")
+        stv = c[1].selectbox("Trạng thái", ["Tất cả"] + STATUSES + ["Xác thực thêm", "Nghi vấn mẫu mới", "Bình thường"],
+                             key=f"tx_st_{rid}")
         f0 = c[2].date_input("Từ ngày", value=d0, min_value=d0, max_value=d1, format="DD/MM/YYYY", key=f"tx_d0_{rid}")
         f1 = c[3].date_input("Đến ngày", value=d1, min_value=d0, max_value=d1, format="DD/MM/YYYY", key=f"tx_d1_{rid}")
         srt = c[4].selectbox("Sắp xếp", ["Điểm rủi ro cao nhất", "Mới nhất", "Số tiền lớn nhất"], key=f"tx_sort_{rid}")
-        c = st.columns([3.2, 0.8, 1], vertical_alignment="bottom")
+        c = st.columns([2.6, 0.75, 0.95, 1], vertical_alignment="bottom")
         q = c[0].text_input("Tìm kiếm", placeholder="Tìm theo mã giao dịch, khách hàng, merchant…", key=f"tx_q_{rid}",
                             label_visibility="collapsed").strip().upper()
         c[1].button("Tìm kiếm", type="primary", width="stretch", key=f"tx_go_{rid}")
+        with c[2].popover("Bộ lọc nâng cao", icon=":material/tune:", width="stretch"):
+            adv = advanced_filters(df, rid)
     v = df.assign(status=df.transaction_id.map(stt))
+    v = apply_advanced(v, adv)
     if lv != "Tất cả":
         v = v[v.risk_level == lv]
     if stv != "Tất cả":
@@ -784,11 +915,11 @@ def page_tx(res):
     b = io.BytesIO()
     v[["transaction_id", "datetime", "customer_id", "amount", "merchant_id", "merchant_category", "payment_channel",
        "location", "risk_score", "risk_level", "status", "case_id", "alert_reason"]].to_csv(b, index=False, encoding="utf-8-sig")
-    c[2].download_button("Tải xuống CSV", b.getvalue(), "giao_dich_loc.csv", "text/csv", icon=":material/download:",
+    c[3].download_button("Tải xuống CSV", b.getvalue(), "giao_dich_loc.csv", "text/csv", icon=":material/download:",
                          width="stretch", key=f"tx_dl_{rid}")
 
     # phân trang
-    sig = f"{lv}|{stv}|{f0}|{f1}|{q}|{srt}"
+    sig = f"{lv}|{stv}|{f0}|{f1}|{q}|{srt}|{adv}"
     pk, sk = f"tx_page_{rid}", f"tx_sig_{rid}"
     if st.session_state.get(sk) != sig:
         st.session_state[sk] = sig
@@ -810,10 +941,12 @@ def page_tx(res):
                     f'<td class="num">{n0(r.amount)}</td><td>{e(r.merchant_id)} <span style="color:#64748B">· '
                     f'{e(r.merchant_category)}</span></td><td>{e(r.customer_id)}</td><td>{e(r.payment_channel)}</td>'
                     f'<td class="num" style="color:{LEVEL_COLOR[r.risk_level] if r.risk_level != "LOW" else "#475467"};'
-                    f'font-weight:700">{d(r.risk_score, 2)}</td><td>{badge(r.risk_level)}</td><td>{stdot(r.status)}</td></tr>')
+                    f'font-weight:700">{d(r.risk_score, 2)}</td><td>{badge(r.risk_level)}</td>'
+                    f'<td>{ACTION_SHORT[r.risk_level]}</td><td>{stdot(r.status)}</td></tr>')
             H('<div class="fs fs-tw"><table class="fs-table"><thead><tr><th>Mã giao dịch</th><th>Thời gian</th>'
               '<th class="num">Số tiền (VND)</th><th>Merchant</th><th>Khách hàng</th><th>Kênh</th><th class="num">Điểm rủi ro</th>'
-              '<th>Mức rủi ro</th><th>Trạng thái</th></tr></thead><tbody>' + "".join(rows) + "</tbody></table></div>")
+              '<th>Mức rủi ro</th><th>Hành động</th><th>Trạng thái</th></tr></thead><tbody>' + "".join(rows)
+              + "</tbody></table></div>")
         c = st.columns([0.9, 0.9, 2.4, 0.55, 0.9, 0.55], vertical_alignment="center")
         c[0].selectbox("Hiển thị", [10, 20, 50, 100], index=[10, 20, 50, 100].index(size), key=f"tx_size_{rid}",
                        format_func=lambda x: f"{x} dòng/trang", label_visibility="collapsed")
@@ -837,7 +970,7 @@ def page_tx(res):
 
 def tx_detail(res, tid):
     df, rep = res["df"], res["report"]
-    thr = rep["threshold"]
+    thr, med = rep["threshold"], rep["medium_threshold"]
     r = df[df.transaction_id == tid].iloc[0]
     with card("tx_head"):
         H(f"""<div class="fs"><div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px">
@@ -845,8 +978,8 @@ def tx_detail(res, tid):
           <span class="fs-sub" style="margin:0">Hạng ưu tiên #{int(r.priority_rank)} / {n0(len(df))}</span></div>
           <div class="fs-case">
             <div class="item"><div class="k">Điểm rủi ro</div><div class="v">{d(r.risk_score, 4)}</div></div>
-            <div class="item"><div class="k">Ngưỡng cảnh báo</div><div class="v">{d(thr, 4)}</div></div>
-            <div class="item"><div class="k">Cảnh báo</div><div class="v">{'Có' if r.predicted_fraud else 'Không'}</div></div>
+            <div class="item"><div class="k">Ngưỡng chặn · xác thực thêm</div><div class="v">{d(thr, 4)} · {d(med, 4)}</div></div>
+            <div class="item"><div class="k">Hành động</div><div class="v">{e(F.ACTIONS[r.risk_level])}</div></div>
             <div class="item"><div class="k">Số tiền</div><div class="v">{money(r.amount)}</div></div>
             <div class="item"><div class="k">Hồ sơ</div><div class="v">{e(r.case_id) if isinstance(r.case_id, str) else '–'}</div></div>
           </div><div class="fs-reason"><b>Lý do:</b> {e(r.alert_reason)}</div></div>""")
@@ -863,8 +996,11 @@ def tx_detail(res, tid):
             fig.add_bar(y=["Điểm"], x=[v], name=f"{nm}: {d(raw, 3)}", orientation="h", marker_color=col,
                         hovertemplate=f"{nm}<br>điểm gốc {d(raw, 4)} · đóng góp {d(v, 4)}<extra></extra>")
         fig.add_vline(x=thr, line=dict(color=NAVY, dash="dash", width=1.5))
-        fig.add_annotation(x=thr, y=1.0, yref="paper", text=f"Ngưỡng {d(thr, 4)}", showarrow=False, yanchor="bottom",
+        fig.add_annotation(x=thr, y=1.0, yref="paper", text=f"Chặn {d(thr, 2)}", showarrow=False, yanchor="bottom",
                            font=dict(size=11, color=NAVY))
+        fig.add_vline(x=med, line=dict(color="#A06A00", dash="dot", width=1.5))
+        fig.add_annotation(x=med, y=1.0, yref="paper", text=f"Xác thực thêm {d(med, 2)}", showarrow=False,
+                           yanchor="bottom", xanchor="right", font=dict(size=11, color="#A06A00"))
         style(fig, 190, barmode="stack", legend=True)
         fig.update_layout(legend=dict(y=-0.25, yanchor="top", traceorder="normal"), margin=dict(t=24, b=6))
         fig.update_xaxes(range=[0, 1], dtick=0.1)
@@ -892,18 +1028,129 @@ def tx_detail(res, tid):
 
 
 # ============================================================================= 3. HỒ SƠ CẢNH BÁO
+QCHIPS = ["Tất cả hồ sơ", "Khẩn cấp chưa xử lý", "Thiết bị dùng chung (R7)", "Xác thực thêm · merchant HIGH",
+          "Nghi vấn mẫu mới"]
+
+
+@st.dialog("Xử lý hàng loạt", width="large")
+def bulk_dialog(res, sel, rtype):
+    ids = [(c, t) for c, s in zip(sel.case_id, sel.transaction_ids) for t in s.split(";")]
+    H(f'<div class="fs fs-sub" style="font-size:14px;color:#1F2937">Bạn sắp ghi <b>một kết luận chung</b> cho '
+      f'<b>{len(sel)} hồ sơ</b> (gồm <b>{len(ids)} giao dịch</b>) cùng loại rủi ro <b>{e(rtype)}</b>: '
+      f'{e(", ".join(sel.case_id.head(8)))}{" …" if len(sel) > 8 else ""}</div>')
+    dec = st.radio("Kết luận", DECISIONS, horizontal=True, key="bulk_dec")
+    a, b = st.columns(2)
+    who = a.text_input("Người xử lý", placeholder="Tên chuyên viên", key="bulk_who")
+    note = b.text_input("Ghi chú", placeholder="VD: cùng một mẫu tấn công", key="bulk_note")
+    c1, c2 = st.columns(2)
+    if c1.button(f"Xác nhận ghi cho {len(sel)} hồ sơ", type="primary", width="stretch", key="bulk_ok"):
+        save_decisions(res["ds"], [{"transaction_id": t, "case_id": c, "decision": dec, "note": f"[Hàng loạt] {note}"[:500],
+                                    "user": (who or "chuyên viên")[:60], "time": now_vn(),
+                                    "threshold": res["report"]["threshold"]} for c, t in ids])
+        st.session_state.flash = f"Đã ghi “{dec}” cho {len(sel)} hồ sơ ({len(ids)} giao dịch)"
+        st.rerun()
+    if c2.button("Huỷ", width="stretch", key="bulk_cancel"):
+        st.rerun()
+
+
+def sim_actions(res, case_id, target, key):
+    """Nút tác vụ nghiệp vụ – chỉ MÔ PHỎNG, ghi vào nhật ký."""
+    H('<div class="fs-sub" style="margin:6px 0 4px">Tác vụ nhanh <b>(mô phỏng – chỉ ghi nhật ký, không tác động hệ thống '
+      'thật)</b></div>')
+    cols = st.columns(3)
+    for col, (k, lab, ic) in zip(cols, SIM_ACTIONS):
+        if col.button(lab, icon=ic, width="stretch", key=f"act_{k}_{key}"):
+            save_action(res["ds"], case_id, target, lab)
+            st.session_state.flash = f"{lab} · {target} (mô phỏng) – đã ghi nhật ký"
+            st.rerun()
+
+
+def txn_queue(res, kind):
+    """Hai hàng đợi theo giao dịch: vùng xác thực thêm tại merchant HIGH, và nghi vấn mẫu mới."""
+    df, rid = res["df"], res["rid"]
+    if kind == QCHIPS[3]:
+        v = df[(df.risk_level == "MEDIUM") & (df.merchant_high == 1)]
+        sub = ("Giao dịch tại merchant rủi ro cao ở vùng MEDIUM: hệ thống không chặn mà tự động yêu cầu xác thực thêm. "
+               "Chuyên viên rà soát để phát hiện mẫu lừa đảo tại merchant.")
+    else:
+        v = df[df.get("novelty", pd.Series(0, index=df.index)) == 1]
+        sub = (f"Giao dịch không bị chặn và không phải xác thực thêm nhưng dị biệt nhất so với giai đoạn quá khứ "
+               f"(Isolation Forest). Giới hạn khoảng {F.NOV_BUDGET} ca cho cả kỳ để không quá tải – dùng để khám phá "
+               "kiểu gian lận chưa có trong luật.")
+    v = v.sort_values("anomaly_score" if kind == QCHIPS[4] else "risk_score", ascending=False).reset_index(drop=True)
+    if v.empty:
+        st.info("Hàng đợi này đang trống.", icon=":material/inbox:")
+        return
+    log = load_log(res["ds"])
+    last = log.drop_duplicates("transaction_id", keep="last").set_index("transaction_id").decision \
+        if len(log) else pd.Series(dtype=str)
+    c1, c2 = st.columns([1.35, 1], gap="medium")
+    with c1, card("tq_list"):
+        title(f"{kind} ({n0(len(v))} giao dịch)", sub)
+        tbl = pd.DataFrame({"Giao dịch": v.transaction_id, "Thời gian": v.datetime.dt.strftime("%d/%m %H:%M"),
+                            "Khách hàng": v.customer_id, "Số tiền": v.amount.map(money),
+                            "Merchant": v.merchant_id + " · " + v.merchant_category.astype(str),
+                            "Điểm": v.risk_score, "Dị biệt": v.anomaly_score,
+                            "Kết luận": v.transaction_id.map(last).fillna("Chưa xem")})
+        ev = grid(tbl, height=460, on_select="rerun", selection_mode="single-row", key=f"tq_tbl_{rid}_{kind}",
+                  column_config={"Điểm": st.column_config.NumberColumn(format="%.3f"),
+                                 "Dị biệt": st.column_config.ProgressColumn(min_value=0, max_value=1, format="%.3f")})
+    try:
+        rows = ev.selection.rows
+    except Exception:  # noqa
+        rows = []
+    r = v.iloc[rows[0] if rows and rows[0] < len(v) else 0]
+    with c2, card("tq_panel"):
+        H(f"""<div class="fs"><div class="fs-phead"><div class="fs-h" style="font-size:17px">{e(r.transaction_id)}</div>
+          {badge(r.risk_level)}</div><div class="fs-dl">
+          <span>Khách hàng</span><b>{e(r.customer_id)} · {e(r.customer_segment)} · {e(r.home_location)}</b>
+          <span>Thời gian</span><b>{dt(r.datetime)}</b><span>Số tiền</span><b>{money(r.amount)} (gấp {d(r.amt_ratio, 1)} lần mức nền)</b>
+          <span>Merchant</span><b>{e(r.merchant_id)} · {e(r.merchant_category)} · rủi ro {e(r.merchant_risk_level)}</b>
+          <span>Thiết bị · tỉnh · IP</span><b>{e(r.device_id)} · {e(r.location)} · {e(r.ip_country)}</b>
+          <span>Điểm · dị biệt</span><b>{d(r.risk_score, 4)} · {d(r.anomaly_score, 3)}</b>
+          <span>Hành động tự động</span><b>{e(F.ACTIONS[r.risk_level])}</b></div>
+          <div class="fs-reason"><b>Lý do:</b> {e(r.alert_reason)}</div></div>""")
+        with st.form(f"tqf_{rid}_{r.transaction_id}", clear_on_submit=True, border=False):
+            dec = st.radio("Kết luận của chuyên viên", DECISIONS, horizontal=True)
+            a, b = st.columns(2)
+            who = a.text_input("Người xử lý", placeholder="Tên chuyên viên")
+            note = b.text_input("Ghi chú", placeholder="VD: mẫu mới, cần thêm luật")
+            if st.form_submit_button("Ghi kết luận", type="primary", icon=":material/task_alt:", width="stretch"):
+                save_decisions(res["ds"], [{"transaction_id": r.transaction_id, "case_id": "", "decision": dec,
+                                            "note": note[:500], "user": (who or "chuyên viên")[:60], "time": now_vn(),
+                                            "threshold": res["report"]["threshold"]}])
+                st.session_state.flash = f"Đã ghi kết luận cho {r.transaction_id}"
+                st.rerun()
+        sim_actions(res, "", r.device_id, f"tq_{r.transaction_id}")
+
+
 def page_cases(res):
     df, cases, rid = res["df"], res["cases"], res["rid"]
     if cases.empty:
         st.info("Không có cảnh báo nào ở ngưỡng hiện tại.")
         return
     cases = cases.assign(case_status=case_status_series(res).values, risk_type=case_types(res).values)
+    tx_r7 = set(df.loc[df.flag_R7 == 1, "transaction_id"])
+    cases = cases.assign(has_r7=cases.transaction_ids.map(lambda s: any(t in tx_r7 for t in s.split(";"))),
+                         sla=cases.case_level.map(SLA_TXT))
     cnt = cases.case_status.value_counts()
-    kgrid([kcard(n0(len(cases)), "Tổng hồ sơ", LEVEL_COLOR["CRITICAL"], f"gom từ {n0(res['report']['n_alerts'])} giao dịch cảnh báo"),
-           kcard(n0(cnt.get("Chưa xử lý", 0)), "Chưa xử lý", LEVEL_COLOR["HIGH"], "chưa có kết luận nào"),
+    urgent = cases[(cases.case_level == "CRITICAL") & (cases.case_status != "Đã xử lý")]
+    kgrid([kcard(n0(len(cases)), "Tổng hồ sơ", LEVEL_COLOR["CRITICAL"], f"gom từ {n0(res['report']['n_alerts'])} giao dịch bị tạm dừng"),
+           kcard(n0(cnt.get("Chưa xử lý", 0)), "Chưa xử lý", LEVEL_COLOR["HIGH"],
+                 f"trong đó {n0(len(urgent))} hồ sơ khẩn cấp (SLA 5 phút)"),
            kcard(n0(cnt.get("Đang xác minh", 0) + cnt.get("Xử lý một phần", 0)), "Đang xem xét", BLUE,
                  "đang xác minh hoặc xử lý một phần"),
            kcard(n0(cnt.get("Đã xử lý", 0)), "Đã xử lý", GREEN, "mọi giao dịch trong hồ sơ đã có kết luận")])
+
+    n_med_mh = int(((df.risk_level == "MEDIUM") & (df.merchant_high == 1)).sum())
+    n_nov = int(df["novelty"].sum()) if "novelty" in df else 0
+    counts = {QCHIPS[0]: len(cases), QCHIPS[1]: len(urgent), QCHIPS[2]: int(cases.has_r7.sum()), QCHIPS[3]: n_med_mh,
+              QCHIPS[4]: n_nov}
+    chip = st.pills("Lọc nhanh", QCHIPS, selection_mode="single", default=QCHIPS[0], key=f"chip_{rid}",
+                    format_func=lambda x: f"{x} · {n0(counts[x])}", label_visibility="collapsed") or QCHIPS[0]
+    if chip in (QCHIPS[3], QCHIPS[4]):
+        txn_queue(res, chip)
+        return
 
     with card("cs_filter"):
         c = st.columns([1, 1.2, 1, 2.2, 0.8], vertical_alignment="bottom")
@@ -915,6 +1162,10 @@ def page_cases(res):
                             ).strip().upper()
         c[4].button("Tìm kiếm", type="primary", width="stretch", key=f"cs_go_{rid}")
     view = cases
+    if chip == QCHIPS[1]:
+        view = urgent
+    elif chip == QCHIPS[2]:
+        view = view[view.has_r7]
     if lv != "Tất cả":
         view = view[view.case_level == lv]
     if ty != "Tất cả":
@@ -929,24 +1180,34 @@ def page_cases(res):
         st.warning("Không có hồ sơ nào khớp bộ lọc.", icon=":material/search_off:")
         return
 
+    bulk = ty != "Tất cả"
     c1, c2 = st.columns([1.35, 1], gap="medium")
     with c1, card("cs_list"):
-        title("Danh sách hồ sơ", f"{n0(len(view))} hồ sơ · sắp theo điểm cao nhất · bấm vào một dòng để xem chi tiết")
+        title("Danh sách hồ sơ", f"{n0(len(view))} hồ sơ · sắp theo điểm cao nhất · "
+              + ("tích nhiều dòng để xử lý hàng loạt cùng loại rủi ro" if bulk
+                 else "bấm một dòng để xem chi tiết · chọn một loại rủi ro để xử lý hàng loạt"))
         tbl = pd.DataFrame({"Mã hồ sơ": view.case_id, "Khách hàng": view.customer_id, "Số GD": view.n_transactions,
-                            "Mức rủi ro": view.case_level, "Loại rủi ro": view.risk_type, "Trạng thái": view.case_status,
-                            "Điểm": view.max_risk_score})
+                            "Mức rủi ro": view.case_level, "SLA": view.sla, "Loại rủi ro": view.risk_type,
+                            "Trạng thái": view.case_status, "Điểm": view.max_risk_score})
         lvl_css = {l: f"color:{LEVEL_COLOR[l]};font-weight:700" for l in LEVELS}
         sty = (tbl.style.map(lambda x: lvl_css.get(x, ""), subset=["Mức rủi ro"])
                .map(lambda x: f"color:{STATUS_COLOR.get(x, '#475467')};font-weight:600", subset=["Trạng thái"])
                .format({"Điểm": lambda x: d(x, 4)}))
-        ev = grid(sty, height=520, on_select="rerun", selection_mode="single-row", key=f"cs_tbl_{rid}",
+        ev = grid(sty, height=520, on_select="rerun", selection_mode="multi-row" if bulk else "single-row",
+                  key=f"cs_tbl_{rid}_{chip}_{ty}",
                   column_config={"Mã hồ sơ": st.column_config.TextColumn(width="small"),
-                                 "Số GD": st.column_config.NumberColumn(width="small")})
-    try:
-        rows = ev.selection.rows
-    except Exception:  # noqa
-        rows = []
-    i = rows[0] if rows and rows[0] < len(view) else 0
+                                 "Số GD": st.column_config.NumberColumn(width="small"),
+                                 "SLA": st.column_config.TextColumn(width="small")})
+        try:
+            rows = [i for i in ev.selection.rows if i < len(view)]
+        except Exception:  # noqa
+            rows = []
+        if bulk:
+            if st.button(f"Xử lý hàng loạt {len(rows)} hồ sơ đã chọn" if rows else "Xử lý hàng loạt (tích chọn hồ sơ trước)",
+                         icon=":material/done_all:", type="primary", disabled=not rows, width="stretch",
+                         key=f"bulk_{rid}_{ty}"):
+                bulk_dialog(res, view.iloc[rows], ty)
+    i = rows[0] if rows else 0
     c = view.iloc[i]
     ids = c.transaction_ids.split(";")
     tx = df[df.transaction_id.isin(ids)].sort_values("datetime")
@@ -963,7 +1224,7 @@ def page_cases(res):
             <span>Tổng số tiền</span><b>{money(c.total_amount)}</b>
             <span>Loại rủi ro</span><b>{e(c.risk_type)}</b>
             <span>Thời gian</span><b>{dt(c.start_time)} → {pd.Timestamp(c.end_time):%H:%M}</b>
-            <span>Điểm cao nhất</span><b>{d(c.max_risk_score, 4)}</b>
+            <span>Điểm cao nhất · SLA</span><b>{d(c.max_risk_score, 4)} · phản ứng trong {e(c.sla)}</b>
             <span>Trạng thái</span><b style="color:{st_color}">{e(c.case_status)}</b>
           </div>
           <div class="fs-cause"><div class="t">Nguyên nhân chính</div><ul>{"".join(f"<li>{e(x)}</li>" for x in reasons)}</ul></div>
@@ -979,6 +1240,7 @@ def page_cases(res):
                                             "threshold": res["report"]["threshold"]} for t in ids])
                 st.session_state.flash = f"Đã ghi quyết định cho {c.case_id} ({len(ids)} giao dịch)"
                 st.rerun()
+        sim_actions(res, c.case_id, ";".join(sorted(set(tx.device_id))), f"cs_{c.case_id}")
         st.caption("Mô hình chỉ cảnh báo và giải thích; quyết định thuộc về chuyên viên và được ghi vào nhật ký kèm phiên bản mô hình.")
     case_detail(res, c, tx)
 
@@ -1014,18 +1276,26 @@ def case_detail(res, c, tx):
                      "now": f"cao nhất {money(tx.amount.max())} (gấp {d(tx.amt_ratio.max(), 1)} lần mức nền)"})
         table(rows, [("k", "Chiều"), ("usual", "Thường dùng"), ("now", "Trong hồ sơ")], raw_cols=("usual", "now"))
     with c2, card("case_net"):
+        fig, n_other = network(tx, cust, df)
         title("Liên kết khách hàng – thiết bị – merchant",
-              "Xanh lá: thiết bị đăng ký cho khách · Đỏ: thiết bị lạ · Màu merchant theo mức rủi ro nền")
-        chart(network(tx, cust), f"net_{c.case_id}")
+              "Xanh lá: thiết bị đăng ký cho khách · Đỏ: thiết bị lạ · Cam: khách hàng khác dùng chung thiết bị"
+              + (f" – {n_other} khách (dấu hiệu số 8, TT 17/2024 sửa đổi bởi TT 25/2025)" if n_other else ""))
+        chart(fig, f"net_{c.case_id}")
     with card("case_log"):
-        title("Nhật ký quyết định của hồ sơ")
+        title("Nhật ký quyết định và tác vụ của hồ sơ")
         lg = load_log(res["ds"])
         lg = lg[lg.case_id == c.case_id].drop_duplicates(["time", "decision", "user", "note"])
-        log = lg.to_dict("records")
+        ac = load_actions(res["ds"])
+        ac = ac[ac.case_id == c.case_id]
+        log = [{"time": r.time, "user": r.user, "decision": r.decision, "note": r.note} for r in lg.itertuples()] + \
+              [{"time": r.time, "user": r.user, "decision": f"{r.action} (mô phỏng)", "note": r.target}
+               for r in ac.itertuples()]
+        log = sorted(log, key=lambda x: datetime.strptime(x["time"], "%d/%m/%Y %H:%M:%S"))
         if log:
-            table(log[::-1], [("time", "Thời điểm"), ("user", "Người xử lý"), ("decision", "Kết luận"), ("note", "Ghi chú")])
+            table(log[::-1], [("time", "Thời điểm"), ("user", "Người xử lý"), ("decision", "Kết luận / tác vụ"),
+                              ("note", "Ghi chú")])
         else:
-            st.caption("Chưa có quyết định nào của chuyên viên cho hồ sơ này.")
+            st.caption("Chưa có quyết định hay tác vụ nào cho hồ sơ này.")
 
 
 # ============================================================================= 4. KIỂM ĐỊNH
@@ -1045,19 +1315,25 @@ def page_eval(res):
            kcard(d(b["pr_auc"]), "PR-AUC", LEVEL_COLOR["HIGH"], "chất lượng xếp hạng, không phụ thuộc ngưỡng")])
     H(f'<div class="fs-sub" style="margin:-6px 0 8px">{n0(n_lab)} giao dịch có nhãn ({n0(n_fr)} gian lận) · 5-fold phân tầng · '
       f'mô hình, trọng số luật và ngưỡng chỉ học trên phần huấn luyện của từng fold · seed {rep["seed"]}</div>')
-    tabs = st.tabs(["Tổng quan", "Hiệu quả từng luật", "Phân tích lỗi dự báo", "So sánh cấu hình", "Độ nhạy ngưỡng",
-                    "Công bằng"])
+    tabs = st.tabs(["Tổng quan", "3 tầng hành động", "Kiểu gian lận mới", "Thời gian thực", "Hiệu quả từng luật",
+                    "Phân tích lỗi dự báo", "So sánh cấu hình", "Độ nhạy ngưỡng", "Công bằng"])
     with tabs[0]:
         eval_overview(res, b)
     with tabs[1]:
-        eval_rules(rep)
+        eval_tiers(res)
     with tabs[2]:
-        eval_errors(rep)
+        eval_loto(rep)
     with tabs[3]:
-        eval_compare(rep)
+        eval_realtime(res)
     with tabs[4]:
-        eval_threshold(res)
+        eval_rules(rep)
     with tabs[5]:
+        eval_errors(rep)
+    with tabs[6]:
+        eval_compare(rep)
+    with tabs[7]:
+        eval_threshold(res)
+    with tabs[8]:
         eval_fair(rep)
 
 
@@ -1065,11 +1341,12 @@ def eval_overview(res, b):
     rep, lv = res["report"], res["lab_view"]
     cnt = {k: v for k, v in rep["labeled_counts"].items() if k != "NORMAL"}
     A = rep["detected_by_type"]["Gộp 3 tầng – có hồ sơ (B, chính thức)"]
-    B = rep["cost_threshold"]["detected_by_type"]
+    B = rep["kpi"]["intervene_by_type"]
     types = sorted(cnt, key=lambda t: -A.get(t, 0) / cnt[t])
     c1, c2 = st.columns([1.3, 1], gap="medium")
     with c1, card("ev_types"):
-        title("Kết quả theo nhóm gian lận", "Tỉ lệ bắt được (Recall) ở mức HIGH/CRITICAL và khi tính cả MEDIUM · mục tiêu 0,80")
+        title("Kết quả theo nhóm gian lận", "Bắt được = bị chặn (HIGH/CRITICAL) · Can thiệp = bị chặn hoặc phải xác thực "
+              "thêm (MEDIUM) · mục tiêu 0,80 cho từng nhóm")
         rows = []
         for t in types:
             r = A.get(t, 0) / cnt[t]
@@ -1084,7 +1361,7 @@ def eval_overview(res, b):
                     f'<td class="num">{d(b["recall"], 2)}</td><td class="num">{sum(B.get(t, 0) for t in types)}/{sum(cnt.values())}</td>'
                     f'<td class="num"><span class="{"yes" if b["recall"] >= .8 else "no"}">{"✓" if b["recall"] >= .8 else "✗"}</span></td></tr>')
         H('<div class="fs fs-tw"><table class="fs-table"><thead><tr><th>Nhóm gian lận</th><th class="num">Số mẫu</th>'
-          '<th class="num">Bắt được</th><th class="num">Recall</th><th class="num">Kể cả MEDIUM</th>'
+          '<th class="num">Bắt được</th><th class="num">Recall</th><th class="num">Can thiệp</th>'
           '<th class="num">Đạt</th></tr></thead><tbody>' + "".join(rows) + "</tbody></table></div>")
     with c2, card("ev_cm"):
         title("Ma trận nhầm lẫn", "Dự đoán ở ngưỡng cảnh báo, gộp 5 fold")
@@ -1107,10 +1384,99 @@ def eval_overview(res, b):
         weak = [t for t in types if A.get(t, 0) / cnt[t] < .8]
         if weak:
             items = "; ".join(f"{FRAUD_VN.get(t, t)} {A.get(t, 0)}/{cnt[t]} ({pct(A.get(t, 0) / cnt[t], 0)})" for t in weak)
+            k = rep["kpi"]
             H(f'<div class="fs fs-warnbox"><div class="ic">!</div><div><div class="t">Điểm cần cải thiện</div>'
-              f'<div class="d">Recall dưới mục tiêu 80%: {e(items)}. Merchant rủi ro trông giống giao dịch thường; giao dịch '
-              f'đầu tiên của chuỗi dồn dập chưa có quá khứ để so. Hướng xử lý: thêm dữ liệu về tài khoản nhận tiền, học lại '
-              f'khi có nhãn mới.</div></div></div>')
+              f'<div class="d">Recall chung ở mức chặn là {pct(b["recall"])}, nhưng tính riêng từng nhóm thì còn dưới mục tiêu '
+              f'80%: {e(items)}. Merchant rủi ro trông giống giao dịch thường; giao dịch đầu tiên của chuỗi dồn dập chưa có '
+              f'quá khứ để so. Tầng xác thực thêm nâng tỉ lệ can thiệp chung lên {pct(k["intervene_recall"])}. Hướng xử lý: '
+              f'thêm dữ liệu về tài khoản nhận tiền, học lại khi có nhãn mới.</div></div></div>')
+
+
+def eval_tiers(res):
+    rep = res["report"]
+    k, ts = rep["kpi"], rep.get("time_split")
+    c1, c2 = st.columns([1.15, 1], gap="medium")
+    with c1, card("ev_tiers"):
+        title("Bộ chỉ số 3 tầng hành động",
+              "Ngưỡng chặn và ngưỡng xác thực thêm đều chọn trên phần huấn luyện của từng fold rồi áp lên phần kiểm tra "
+              "(ngưỡng lồng) – con số dưới đây là kết quả ngoài mẫu")
+        rows = [{"m": "Recall can thiệp (chặn hoặc xác thực thêm)", "v": f'{pct(k["intervene_recall"])} ({k["intervene_tp"]}/{k["n_fraud"]})',
+                 "c": f'{k["stepup_legit"]} khách thật ({pct(k["stepup_legit_rate"], 2)}) phải xác thực thêm'},
+                {"m": "Giá trị tiền gian lận bị chặn", "v": pct(k["value_recall_hard"]),
+                 "c": f'{pct(k["value_recall_intervene"])} nếu tính cả xác thực thêm; ca sót lớn nhất '
+                      f'{money_short(k["missed_value_top"][0]) if k["missed_value_top"] else "–"}'},
+                {"m": "Recall theo vụ tấn công", "v": f'{pct(k["case_recall"])} ({k["attacks_detected"]}/{k["n_attacks"]} vụ)',
+                 "c": "vụ = các giao dịch gian lận của cùng khách cách nhau ≤ 30 phút; tính từ cảnh báo tại thời điểm giao dịch"},
+                {"m": "Recall chặn ngay tại thời điểm giao dịch", "v": f'{pct(k["hard_recall"])} ({k["hard_tp"]}/{k["n_fraud"]})',
+                 "c": f'{k["hard_fp"]} báo nhầm / {n0(k["n_legit"])} giao dịch thật'}]
+        if ts:
+            rows.append({"m": f"Kiểm tra theo thời gian (học {ts['train_months']}, kiểm tra {ts['test_months']})",
+                         "v": f'can thiệp {pct(ts["intervene_recall"])} · chặn {pct(ts["recall"])}',
+                         "c": f'{pct(ts["stepup_legit_rate"], 2)} khách thật phải xác thực thêm · {ts["fp"]} báo nhầm'})
+        table(rows, [("m", "Chỉ số"), ("v", "Kết quả"), ("c", "Ghi chú")], num_cols=("v",))
+        st.caption(f"Ngưỡng xác thực thêm đặt để Recall can thiệp trên dữ liệu học ≥ {pct(k['target_intervene'], 0)} "
+                   f"(biên an toàn để ngoài mẫu ≥ 90%), nhưng không quá {pct(k['stepup_cap'], 0)} khách thật phải xác thực "
+                   f"thêm. Ngưỡng chọn ở 5 fold: {', '.join(d(x, 3) for x in k['med_folds'])} · ngưỡng dùng chung: "
+                   f"{d(rep['medium_threshold'], 4)}.")
+    with c2, card("ev_tiers_type"):
+        title("Theo nhóm gian lận", "Số ca bị chặn và số ca được can thiệp (chặn hoặc xác thực thêm)")
+        cnt = {t: v for t, v in rep["labeled_counts"].items() if t not in ("NORMAL",)}
+        tt = sorted(cnt, key=lambda t: -cnt[t])
+        fig = go.Figure()
+        fig.add_bar(y=[FRAUD_VN.get(t, t) for t in tt], x=[k["hard_by_type"].get(t, 0) / cnt[t] for t in tt],
+                    orientation="h", name="Bị chặn", marker_color=LEVEL_COLOR["CRITICAL"],
+                    text=[f'{k["hard_by_type"].get(t, 0)}/{cnt[t]}' for t in tt], textposition="inside")
+        fig.add_bar(y=[FRAUD_VN.get(t, t) for t in tt], x=[k["intervene_by_type"].get(t, 0) / cnt[t] for t in tt],
+                    orientation="h", name="Can thiệp", marker_color=LEVEL_COLOR["MEDIUM"],
+                    text=[f'{k["intervene_by_type"].get(t, 0)}/{cnt[t]}' for t in tt], textposition="inside")
+        style(fig, 330, barmode="group")
+        fig.update_xaxes(tickformat=".0%", range=[0, 1.05])
+        fig.add_vline(x=0.8, line=dict(color=NAVY, dash="dash", width=1))
+        chart(fig, "ev_tier_type")
+    with card("ev_tiers_note"):
+        title("Tầng xác thực thêm chặn được gì, không chặn được gì")
+        H('<div class="fs fs-sub" style="font-size:13.5px;color:#1F2937;line-height:1.6">Yêu cầu xác thực thêm (OTP/sinh '
+          'trắc học) ngăn được kẻ gian chiếm đoạt tài khoản, dùng thông tin thẻ đánh cắp hoặc giao dịch từ thiết bị lạ. '
+          'Với lừa đảo thao túng tâm lý – dụ chính chủ tài khoản tự chuyển tiền và tự xác thực – bước này không tự chặn '
+          'được; cần kết hợp cảnh báo tài khoản nhận tiền (hướng phát triển khi có dữ liệu luồng tiền nhận). Quyết định '
+          '2345/QĐ-NHNN bắt buộc sinh trắc học theo ngưỡng tiền (trên 10 triệu/lần, 20 triệu/ngày) và khi giao dịch lần đầu '
+          'trên thiết bị mới; tầng xác thực thêm theo điểm rủi ro là biện pháp quản trị rủi ro bổ sung của ngân hàng.</div>')
+
+
+def eval_loto(rep):
+    lo = rep.get("loto")
+    if not lo:
+        st.caption("Không có dữ liệu.")
+        return
+    tot = lo[-1]
+    with card("ev_loto"):
+        title("Thí nghiệm ẩn từng kiểu gian lận",
+              "Coi mỗi kiểu là một thủ đoạn mô hình chưa từng gặp: bỏ toàn bộ nhãn của kiểu đó khỏi dữ liệu học và tắt luật "
+              "tương ứng, học lại hồi quy logistic và trọng số luật trên phần còn lại; Isolation Forest giữ nguyên (không dùng "
+              "nhãn); giữ nguyên ngưỡng hiện hành; đếm số ca của kiểu bị ẩn mà hệ thống vẫn can thiệp")
+        rows = [{"t": FRAUD_VN.get(o["type"], o["type"]) if o["type"] != "TỔNG" else "Tổng", "r": o["rules_off"],
+                 "n": o["n"], "h": f'{o["high"]} ({pct(o["high"] / o["n"], 0)})',
+                 "m": f'{o["medium_plus"]} ({pct(o["medium_plus"] / o["n"], 0)})', "q": o["queue"]} for o in lo]
+        table(rows, [("t", "Kiểu bị ẩn"), ("r", "Luật bị tắt"), ("n", "Số ca"), ("h", "Bị chặn"),
+                     ("m", "Chặn hoặc xác thực thêm"), ("q", "Vào hàng đợi mẫu mới")],
+              num_cols=("n", "h", "m", "q"), hl_last=True)
+        H(f'<div class="fs fs-reason"><b>Kết luận:</b> với kiểu gian lận mô hình chưa từng học, hệ thống vẫn chặn '
+          f'{tot["high"]}/{tot["n"]} ca và can thiệp (chặn hoặc bắt xác thực thêm) {tot["medium_plus"]}/{tot["n"]} ca '
+          f'({pct(tot["medium_plus"] / tot["n"], 0)}), nhờ các dấu vết lệch thói quen chung. Điểm yếu: chuỗi giao dịch '
+          f'dồn dập khi tắt luật R6. Hàng đợi nghi vấn mẫu mới (Isolation Forest, giới hạn ~{F.NOV_BUDGET} ca/kỳ) chỉ thêm '
+          f'{tot["queue"]} ca – trên dữ liệu này dị biệt đơn thuần chưa phải tín hiệu mạnh.</div>')
+
+
+def eval_realtime(res):
+    with card("ev_rt"):
+        title("Chấm điểm thời gian thực", "Kết quả kiểm tra trùng khớp giữa chấm theo luồng và chấm theo lô")
+        p = st.session_state.get("parity", {}).get(res["rid"])
+        if p:
+            parity_view(p)
+        else:
+            st.caption("Chưa chạy kiểm tra trùng khớp. Vào mục Luồng thời gian thực để chạy (khoảng 5–10 giây).")
+            st.button("Mở Luồng thời gian thực", icon=":material/bolt:", key="ev_go_live",
+                      on_click=lambda: st.session_state.update(nav="live"))
 
 
 def eval_rules(rep):
@@ -1191,10 +1557,12 @@ def eval_threshold(res):
         cost = rep["cost_threshold"]["threshold"]
         if key not in st.session_state:
             st.session_state[key] = float(rep["threshold"])
-        b1, b2, _ = st.columns([1, 1.3, 2])
-        b1.button(f"Cân bằng F1 · {d(rep['threshold'], 4)}", width="stretch", key=f"pf_{res['rid']}",
+        b1, b2, b3, _ = st.columns([1, 1.15, 1.3, 0.6])
+        b1.button(f"Ngưỡng chặn · {d(rep['threshold'], 4)}", width="stretch", key=f"pf_{res['rid']}",
                   on_click=lambda: st.session_state.update({key: float(rep["threshold"])}))
-        b2.button(f"Theo chi phí (bỏ sót = 10 × báo nhầm) · {d(cost, 4)}", width="stretch", key=f"pc_{res['rid']}",
+        b2.button(f"Ngưỡng xác thực thêm · {d(rep['medium_threshold'], 4)}", width="stretch", key=f"pm_{res['rid']}",
+                  on_click=lambda: st.session_state.update({key: float(rep["medium_threshold"])}))
+        b3.button(f"Theo chi phí (bỏ sót = 10 × báo nhầm) · {d(cost, 4)}", width="stretch", key=f"pc_{res['rid']}",
                   on_click=lambda: st.session_state.update({key: float(cost)}))
         t = st.slider("Ngưỡng", 0.05, 0.99, step=0.0005, format="%.4f", key=key)
         y, s = lv.y.values, lv.score.values
@@ -1236,6 +1604,176 @@ def eval_fair(rep):
         style(fig, 300, legend=False)
         fig.update_xaxes(tickformat=".0%", range=[0, geo.max() * 1.22])
         chart(fig, "geo")
+
+
+# ============================================================================= LUỒNG THỜI GIAN THỰC
+SPEEDS = {"1 GD/giây": 1, "2 GD/giây": 2, "5 GD/giây": 5, "Tua nhanh · 50 GD/giây": 50}
+
+
+def parity_view(p):
+    ok = p["n_score_mismatch"] == 0 and p["n_level_mismatch"] == 0
+    H('<div class="fs fs-kgrid" style="margin:4px 0 6px">' + "".join([
+        kcard(n0(p["n"]), "Giao dịch chạy qua luồng", BLUE, "từng giao dịch một, đúng thứ tự thời gian"),
+        kcard(n0(p["n_score_mismatch"]), "Giao dịch lệch điểm", GREEN if ok else LEVEL_COLOR["CRITICAL"],
+              f"chênh lớn nhất {p['max_abs_diff']:.1e} · lệch mức: {p['n_level_mismatch']}",
+              "Trùng 100%" if ok else "Có lệch", "#E6F4EA" if ok else "#FFE3E3"),
+        kcard(f"{d(p['latency_mean_ms'], 2)} ms", "Thời gian chấm 1 giao dịch", PURPLE,
+              f"p95 {d(p['latency_p95_ms'], 2)} ms · p99 {d(p['latency_p99_ms'], 2)} ms · lớn nhất {d(p['latency_max_ms'], 2)} ms"),
+        kcard(f"{d(p['total_s'], 1)} s", "Tổng thời gian chạy", TEAL,
+              f"đặc trưng lệch lớn nhất {p['max_feature_diff']:.1e}")]) + "</div>")
+    H(f'<div class="fs fs-reason"><b>Ý nghĩa:</b> bộ chấm luồng chỉ biết các giao dịch đã xảy ra trước đó (bảng trạng thái '
+      f'trong bộ nhớ). Điểm của nó trùng với bản chấm theo lô cho {"toàn bộ" if ok else "phần lớn"} {n0(p["n"])} giao dịch – '
+      f'bằng chứng mô hình không dùng dữ liệu tương lai. Cùng một mô hình đóng băng ({e(p["model"])}).</div>')
+
+
+def live_init(res):
+    m = res.get("model_live") or res["model"]
+    T = res["tables"]
+    order = RT.stream_order(T["transactions.csv"])
+    start = m.info.get("start")
+    dtv = pd.to_datetime(order.datetime)
+    hist = order[dtv < start] if start is not None else order.iloc[:0]
+    live = order[dtv >= start] if start is not None else order
+    sc = RT.OnlineScorer(m, T["customers.csv"], T["merchants.csv"], T["devices.csv"])
+    sc.warm(hist.to_dict("records"))
+    lab = T.get("fraud_labels_sample.csv")
+    st.session_state.live = {
+        "rid": res["rid"], "sc": sc, "rows": live.to_dict("records"), "i": 0, "out": [], "running": False,
+        "n_hist": len(hist), "labels": dict(zip(lab.transaction_id, lab.is_fraud.astype(int))) if lab is not None else {},
+        "handled": set(), "model": m}
+
+
+def live_step(L, n):
+    for _ in range(n):
+        if L["i"] >= len(L["rows"]):
+            L["running"] = False
+            break
+        t = L["rows"][L["i"]]
+        r = L["sc"].score(t)
+        L["out"].append({"tid": t["transaction_id"], "dt": pd.Timestamp(t["datetime"]), "cust": t["customer_id"],
+                         "amount": float(t["amount"]), "merchant": t["merchant_id"], "score": r["risk_score"],
+                         "level": r["risk_level"], "nov": r["novelty"], "reason": r["alert_reason"],
+                         "ms": r["latency_ms"], "wall": time.time(), "y": L["labels"].get(t["transaction_id"])})
+        L["i"] += 1
+
+
+def live_body():
+    L = st.session_state.live
+    if L["running"]:
+        live_step(L, SPEEDS.get(st.session_state.get("live_speed"), 2))
+    out = L["out"]
+    o = pd.DataFrame(out) if out else pd.DataFrame(columns=["tid", "dt", "cust", "amount", "merchant", "score", "level",
+                                                             "nov", "reason", "ms", "wall", "y"])
+    lv = o.level.value_counts() if len(o) else pd.Series(dtype=int)
+    ms = o.ms.values if len(o) else np.array([0.0])
+    clock = o.dt.iloc[-1] if len(o) else None
+    kgrid([kcard(f"{n0(len(o))}/{n0(len(L['rows']))}", "Giao dịch đã chấm", BLUE,
+                 f"đồng hồ luồng: {clock:%d/%m/%Y %H:%M:%S}" if clock is not None else "chưa bắt đầu"),
+           kcard(n0(lv.get("CRITICAL", 0) + lv.get("HIGH", 0)), "Tạm dừng giao dịch", LEVEL_COLOR["CRITICAL"],
+                 f"CRITICAL {n0(lv.get('CRITICAL', 0))} · HIGH {n0(lv.get('HIGH', 0))}"),
+           kcard(n0(lv.get("MEDIUM", 0)), "Yêu cầu xác thực thêm", LEVEL_COLOR["MEDIUM"],
+                 f"cho qua {n0(lv.get('LOW', 0))} · nghi vấn mẫu mới {n0(int(o.nov.sum()) if len(o) else 0)}"),
+           kcard(f"{d(float(np.mean(ms)), 2)} ms", "Thời gian chấm 1 giao dịch", PURPLE,
+                 f"p99 {d(float(np.percentile(ms, 99)), 2)} ms · lớn nhất {d(float(np.max(ms)), 2)} ms")])
+    if len(o):
+        last_alert = o[o.level.isin(["CRITICAL", "HIGH"])].tail(1)
+        if len(last_alert):
+            a = last_alert.iloc[0]
+            fresh = time.time() - a.wall < 4
+            H(f'<div class="fs fs-warnbox" style="{"" if fresh else "opacity:.8"}"><div class="ic">!</div><div>'
+              f'<div class="t">{"Vừa tạm dừng" if fresh else "Lần tạm dừng gần nhất"}: {e(a.tid)} · {e(a.cust)} · '
+              f'{money(a.amount)} · {badge(a.level)}</div><div class="d">{e(a.reason)}</div></div></div>')
+    c1, c2 = st.columns([1.45, 1], gap="medium")
+    with c1, card("live_feed"):
+        title("Giao dịch vừa chấm", "Mới nhất ở trên · mỗi giao dịch được chấm ngay khi đến, chỉ dùng thông tin trước đó")
+        if len(o):
+            rows = []
+            for r in o.tail(14).iloc[::-1].itertuples():
+                rows.append(f'<tr><td>{r.dt:%d/%m %H:%M:%S}</td><td class="mono">{e(r.tid)}</td><td>{e(r.cust)}</td>'
+                            f'<td class="num">{n0(r.amount)}</td><td class="num" style="font-weight:700;color:'
+                            f'{LEVEL_COLOR[r.level] if r.level != "LOW" else "#475467"}">{d(r.score, 3)}</td>'
+                            f'<td>{badge(r.level)}</td><td>{ACTION_SHORT[r.level] + (" · mẫu mới?" if r.nov else "")}</td>'
+                            f'<td class="num">{d(r.ms, 2)}</td></tr>')
+            H('<div class="fs fs-tw"><table class="fs-table"><thead><tr><th>Thời điểm</th><th>Giao dịch</th><th>Khách</th>'
+              '<th class="num">Số tiền</th><th class="num">Điểm</th><th>Mức</th><th>Hành động</th><th class="num">ms</th>'
+              '</tr></thead><tbody>' + "".join(rows) + "</tbody></table></div>")
+        else:
+            st.caption("Bấm Bắt đầu để phát luồng giao dịch.")
+    with c2, card("live_sla"):
+        title("Hàng đợi trực tiếp · đồng hồ SLA",
+              "Cảnh báo vừa phát sinh trong phiên giả lập · CRITICAL phải phản ứng trong 5 phút, HIGH trong 2 giờ")
+        al = o[o.level.isin(["CRITICAL", "HIGH"]) & ~o.tid.isin(L["handled"])] if len(o) else o
+        if len(al):
+            now = time.time()
+            rows = []
+            for r in al.tail(8).iloc[::-1].itertuples():
+                left = SLA_S[r.level] - (now - r.wall)
+                mm, ss = divmod(int(abs(left)), 60)
+                hh, mm = divmod(mm, 60)
+                tl = (f"{hh}:{mm:02d}:{ss:02d}" if hh else f"{mm}:{ss:02d}")
+                col = "#2F9E44" if left > SLA_S[r.level] * 0.4 else "#F59F00" if left > 0 else "#E03131"
+                rows.append(f'<tr><td class="mono">{e(r.tid)}</td><td>{badge(r.level)}</td>'
+                            f'<td class="num" style="color:{col};font-weight:700">{"còn " if left > 0 else "quá hạn "}{tl}</td></tr>')
+            H('<div class="fs fs-tw"><table class="fs-table"><thead><tr><th>Giao dịch</th><th>Mức</th><th class="num">SLA</th>'
+              '</tr></thead><tbody>' + "".join(rows) + "</tbody></table></div>")
+            c = st.columns([2, 1], vertical_alignment="bottom")
+            pick = c[0].selectbox("Đánh dấu đã xử lý", al.tid.tolist()[::-1], key="live_pick", label_visibility="collapsed")
+            if c[1].button("Đã xử lý", key="live_done", width="stretch"):
+                L["handled"].add(pick)
+        else:
+            st.caption("Chưa có cảnh báo nào đang chờ.")
+        lab = o[o.y.notna()] if len(o) else o
+        if len(lab):
+            fr, lg = lab[lab.y == 1], lab[lab.y == 0]
+            H('<div class="fs-h" style="margin-top:12px">Đối chiếu đáp án BTC (giao dịch có nhãn trong luồng)</div>')
+            table([{"k": f"Gian lận thật ({len(fr)})",
+                    "a": f'{int(fr.level.isin(["CRITICAL", "HIGH"]).sum())} chặn · {int((fr.level == "MEDIUM").sum())} '
+                         f'xác thực thêm · {int((fr.level == "LOW").sum())} lọt'},
+                   {"k": f"Giao dịch thật ({len(lg)})",
+                    "a": f'{int(lg.level.isin(["CRITICAL", "HIGH"]).sum())} chặn nhầm · {int((lg.level == "MEDIUM").sum())} '
+                         f'phải xác thực thêm'}], [("k", "Nhóm"), ("a", "Hệ thống đã làm gì")])
+
+
+def page_live(res):
+    L = st.session_state.get("live")
+    if L is None or L.get("rid") != res["rid"]:
+        with st.spinner("Đang dựng bảng trạng thái từ lịch sử giao dịch…"):
+            live_init(res)
+        L = st.session_state.live
+    m = L["model"]
+    with card("live_head"):
+        title("Giả lập luồng giao dịch thời gian thực",
+              f"Mô hình học trên {e(m.info.get('train') or 'toàn bộ nhãn')}; luồng phát {n0(len(L['rows']))} giao dịch "
+              f"{e(m.info.get('test') or '')} mà mô hình chưa từng thấy · đã nạp {n0(L['n_hist'])} giao dịch lịch sử vào bảng "
+              f"trạng thái · ngưỡng chặn {d(m.thr, 4)} · ngưỡng xác thực thêm {d(m.med, 4)}")
+        c = st.columns([2.2, 0.9, 0.9, 0.9], vertical_alignment="bottom")
+        c[0].segmented_control("Tốc độ", list(SPEEDS), default="2 GD/giây", key="live_speed")
+        running = L["running"]
+        if c[1].button("Tạm dừng" if running else ("Tiếp tục" if L["i"] else "Bắt đầu"),
+                       icon=":material/pause:" if running else ":material/play_arrow:", type="primary", width="stretch",
+                       key="live_run", disabled=L["i"] >= len(L["rows"])):
+            L["running"] = not running
+            st.rerun()
+        if c[2].button("+1 giao dịch", icon=":material/skip_next:", width="stretch", key="live_one",
+                       disabled=running or L["i"] >= len(L["rows"])):
+            live_step(L, 1)
+        if c[3].button("Làm lại", icon=":material/restart_alt:", width="stretch", key="live_reset"):
+            live_init(res)
+            st.rerun()
+    st.fragment(live_body, run_every=1.0 if L["running"] else None)()
+    with card("live_parity"):
+        title("Kiểm tra trùng khớp lô – luồng",
+              f"Cho toàn bộ {n0(len(res['df']))} giao dịch đi qua bộ chấm luồng từng giao dịch một và đối chiếu với chấm theo lô "
+              "bằng cùng một mô hình đóng băng")
+        par = st.session_state.setdefault("parity", {})
+        if st.button("Chạy kiểm tra trùng khớp", icon=":material/fact_check:", key="btn_parity",
+                     type="secondary" if res["rid"] in par else "primary"):
+            bar = st.progress(0.0, text="Đang chạy từng giao dịch…")
+            par[res["rid"]] = RT.parity_check(res["model"], res["tables"],
+                                              progress=lambda x: bar.progress(min(1.0, x), text="Đang chạy từng giao dịch…"))
+            bar.empty()
+        if res["rid"] in par:
+            parity_view(par[res["rid"]])
 
 
 # ============================================================================= 5. DỮ LIỆU & CHẠY MÔ HÌNH
@@ -1305,12 +1843,13 @@ def page_data(res):
                     ("Ngày dữ liệu", f'{res["report"]["period"][0]} – {res["report"]["period"][1]}'),
                     ("Chế độ", "Huấn luyện + kiểm định" if res["mode"] == "train" else "Chỉ chấm điểm (mô hình học sẵn)"),
                     ("Thời gian chạy", f'{str(res.get("seconds", "–")).replace(".", ",")} giây'),
+                    ("Phiên bản mô hình", e(res.get("version_label", "Bản gốc"))),
                     ("Trạng thái", '<span class="fs-badge b-ĐẠT">Hợp lệ</span>')]) + "</div>")
             else:
                 st.caption("Chưa có dữ liệu.")
         with card("dt_run"):
-            title("Chạy mô hình", "Quá trình chạy gồm: Hệ luật (R1–R7) + Hồi quy logistic + Isolation Forest, "
-                  "gộp điểm 0,6 – 0,3 – 0,1, xếp 4 mức và gom hồ sơ")
+            title("Chạy mô hình", "Hệ luật (R1–R7) + Hồi quy logistic + Isolation Forest (học trên giai đoạn quá khứ), "
+                  "gộp điểm 0,6 – 0,3 – 0,1, xếp 3 tầng hành động và gom hồ sơ")
             if st.button("Chạy mô hình với dữ liệu tải lên" if ups else "Chạy mô hình với Data Pack BTC", type="primary",
                          icon=":material/play_arrow:", width="stretch", key="btn_run",
                          disabled=not ups and not (SAMPLE_DIR / "transactions.csv").exists()):
@@ -1327,6 +1866,7 @@ def page_data(res):
             checks_table(failed["checks"] if failed else res["checks"])
     if res is not None:
         downloads(res)
+        retrain_section(res)
         with card("dt_admin"):
             title("Quản trị", "Kết luận của chuyên viên lưu trên máy chủ đến khi ứng dụng khởi động lại.")
             a, b = st.columns([2, 1], vertical_alignment="center")
@@ -1334,6 +1874,76 @@ def page_data(res):
             if b.button("Xoá kết luận đã ghi", disabled=not sure, width="stretch", key="btn_clear", icon=":material/delete:"):
                 clear_decisions(res["ds"])
                 st.session_state.flash = "Đã xoá các kết luận đã ghi"
+                st.rerun()
+
+
+def retrain_section(res):
+    with card("dt_retrain"):
+        title("Học lại có kiểm soát (quản trị viên)",
+              "Đưa kết luận của chuyên viên (Xác nhận gian lận = 1, Báo động giả = 0) vào dữ liệu học. Mô hình mới chỉ được "
+              "áp dụng sau khi so sánh trước – sau trên tập kiểm tra độc lập theo thời gian, và luôn khôi phục được bản cũ.")
+        ex = analyst_labels(res["ds"])
+        btc = res["tables"].get("fraud_labels_sample.csv")
+        new = ex[~ex.transaction_id.isin(btc.transaction_id)] if btc is not None else ex
+        H('<div class="fs fs-dl">' + "".join(f"<span>{k}</span><b>{v}</b>" for k, v in [
+            ("Phiên bản đang dùng", e(res.get("version_label", "Bản gốc"))),
+            ("Kết luận của chuyên viên", f"{n0(len(ex))} giao dịch ({n0(int(ex.is_fraud.sum()))} gian lận, "
+                                         f"{n0(int((ex.is_fraud == 0).sum()))} báo động giả)"),
+            ("Nhãn mới (chưa có trong nhãn BTC)", n0(len(new)))]) + "</div>")
+        H('<div class="fs fs-warnbox" style="background:#FFF9DB;border-color:#FFE066"><div class="ic" style="background:#F59F00">!'
+          '</div><div><div class="t" style="color:#A06A00">Lưu ý độ lệch mẫu</div><div class="d">Chuyên viên chỉ kết luận trên '
+          'các giao dịch đã bị cảnh báo, nên nhãn mới lệch về phía “điểm cao”. Vì vậy mô hình mới phải được so với mô hình cũ '
+          'trên nhãn BTC của giai đoạn sau (không dùng để học) trước khi áp dụng.</div></div></div>')
+        admin = st.toggle("Tôi là quản trị viên (mô phỏng phân quyền – bản trình diễn chưa có đăng nhập)", key="is_admin")
+        vers = st.session_state.setdefault("versions", [])
+        if not admin:
+            return
+        if res["mode"] != "train":
+            st.caption("Cần Data Pack có nhãn BTC để kiểm tra trước – sau.")
+        elif len(new) < 3:
+            st.info("Cần ít nhất 3 kết luận mới của chuyên viên (ở mục Hàng đợi của tôi) để học lại.", icon=":material/info:")
+        else:
+            key = f"{res['rid']}|{len(new)}|{int(new.is_fraud.sum())}"
+            if st.button("So sánh trước – sau", icon=":material/compare_arrows:", key="btn_cmp"):
+                with st.spinner("Đang học lại và kiểm tra trên giai đoạn sau…"):
+                    st.session_state.rt_cmp = (key, F.retrain_compare(res, new))
+            cmp = st.session_state.get("rt_cmp")
+            if cmp and cmp[0] == key and cmp[1]:
+                c = cmp[1]
+                b_, a_ = c["before"], c["after"]
+                rows = [{"m": "Nhãn dùng để học", "b": f'{n0(b_["n_train"])} ({b_["fraud_train"]} gian lận)',
+                         "a": f'{n0(a_["n_train"])} ({a_["fraud_train"]} gian lận)'},
+                        {"m": "PR-AUC trên giai đoạn kiểm tra", "b": d(b_["pr_auc"]), "a": d(a_["pr_auc"])},
+                        {"m": "Recall chặn", "b": d(b_["recall"]), "a": d(a_["recall"])},
+                        {"m": "Báo nhầm", "b": b_["fp"], "a": a_["fp"]},
+                        {"m": "Recall can thiệp", "b": d(b_["intervene_recall"]), "a": d(a_["intervene_recall"])},
+                        {"m": "Khách thật phải xác thực thêm", "b": pct(b_["stepup_rate"], 2), "a": pct(a_["stepup_rate"], 2)}]
+                table(rows, [("m", f"Học {c['train_period']} · kiểm tra {c['test_period']} ({c['fraud_test']} gian lận)"),
+                             ("b", "Trước"), ("a", "Sau")], num_cols=("b", "a"))
+                st.caption(f"Dùng {c['n_new_labels']} nhãn mới thuộc giai đoạn học; {c['n_ignored_future']} nhãn thuộc giai đoạn "
+                           "kiểm tra không được dùng ở bước so sánh này để tránh rò rỉ.")
+                if c["recommend"]:
+                    st.success("Mô hình mới không làm giảm chất lượng trên giai đoạn kiểm tra – có thể áp dụng.",
+                               icon=":material/check_circle:")
+                else:
+                    st.warning("Mô hình mới làm giảm chất lượng – không nên áp dụng.", icon=":material/warning:")
+                sure = st.checkbox("Tôi đã xem bảng so sánh và đồng ý áp dụng", key="chk_apply")
+                if st.button("Áp dụng mô hình mới", type="primary", icon=":material/published_with_changes:",
+                             disabled=not (sure and c["recommend"]), key="btn_apply"):
+                    with st.spinner("Đang học lại toàn bộ mô hình…"):
+                        files = st.session_state.get("files") or sample_files()
+                        r2 = engine(files, new.reset_index(drop=True))
+                    vers.append(st.session_state.res)
+                    store_result(r2, files, [], res["source"],
+                                 label=f"Học lại · +{len(new)} nhãn chuyên viên · {now_vn()}")
+                    st.session_state.flash = "Đã áp dụng mô hình học lại"
+                    st.rerun()
+        if vers:
+            prev = vers[-1]
+            st.caption(f"Phiên bản trước: {prev.get('version_label', 'Bản gốc')}")
+            if st.button("Khôi phục phiên bản trước (Rollback)", icon=":material/undo:", key="btn_rollback"):
+                st.session_state.res = vers.pop()
+                st.session_state.flash = "Đã khôi phục phiên bản trước"
                 st.rerun()
 
 
@@ -1367,7 +1977,7 @@ def downloads(res):
 
 
 # ============================================================================= khung chính
-PAGES = {"overview": page_overview, "tx": page_tx, "cases": page_cases, "eval": page_eval}
+PAGES = {"overview": page_overview, "tx": page_tx, "cases": page_cases, "eval": page_eval, "live": page_live}
 
 if "res" not in st.session_state and "failed" not in st.session_state and "tried_sample" not in st.session_state:
     st.session_state.tried_sample = True

@@ -1,33 +1,46 @@
-# Fraud Shield – Web app Streamlit
+# Fraud Shield v3.1 – Web app Streamlit
 
-Bàn làm việc chống gian lận thanh toán số · Festival Chuyển đổi số 2026 · Bảng B.
-Ứng dụng chạy **đúng lõi mô hình trong hồ sơ** (`fraud_core.py`). Trên Data Pack BTC cho ra
-F1 0,874 · Recall 0,836 · PR-AUC 0,934 · 474 cảnh báo · 326 case · ngưỡng 0,7399.
-Mọi đặc trưng chỉ dùng thông tin có trước hoặc tại thời điểm giao dịch (cửa sổ 5 phút và 30 phút nhìn lùi,
-hồ sơ hành vi chỉ từ các giao dịch trước đó).
+Bàn làm việc chống gian lận thanh toán số · Festival Chuyển đổi số 2026 · Bảng B · bản vòng Chung kết.
+Mọi đặc trưng chỉ dùng thông tin có trước hoặc tại thời điểm giao dịch; Isolation Forest và bảng phân vị
+tham chiếu chỉ học trên giai đoạn quá khứ (tháng 1–4).
 
-## Ứng dụng có gì
+Kết quả trên Data Pack BTC (kiểm định 5-fold, ngưỡng lồng – số ngoài mẫu):
 
-Thanh điều hướng bên trái, 5 màn hình:
+| Chỉ số | Kết quả |
+|---|---|
+| Recall can thiệp (chặn hoặc xác thực thêm) | 91,4% (117/128) · 1,44% khách thật phải xác thực thêm |
+| Giá trị tiền gian lận bị chặn | 93,6% (98,1% nếu tính cả xác thực thêm) |
+| Recall theo vụ tấn công | 85,7% (96/112 vụ) |
+| Recall chặn ngay (HIGH/CRITICAL) | 82,8% (106/128) · 10 báo nhầm / 1.872 · F1 0,869 · PR-AUC 0,934 |
+| Kiểm tra theo thời gian (học T1–4, thử T5–6) | F1 0,854 · can thiệp 86,4% |
+| Kiểu gian lận chưa từng học (ẩn từng kiểu) | chặn 76/128 · can thiệp 96/128 (75%) |
+| Chấm điểm thời gian thực | trùng 100% với chấm theo lô trên 8.000 giao dịch · ~0,4 ms/giao dịch |
 
-- **Tổng quan**: 4 chỉ số chính (giao dịch đã chấm, giao dịch cảnh báo, hồ sơ cần xem xét, F1), phân bố 4 mức rủi ro,
-  Precision/Recall/F1/PR-AUC, xu hướng cảnh báo theo tuần, top 5 loại rủi ro, tiến độ xử lý, 5 hồ sơ cần xử lý trước.
-- **Giao dịch**: lọc theo mức, trạng thái, ngày; tìm theo mã giao dịch/khách/merchant; phân trang; tải CSV;
-  xem chi tiết điểm từng lớp, luật đã bật, độ lệch thói quen của khách.
-- **Hồ sơ cảnh báo**: hồ sơ (case) gom các cảnh báo cùng khách trong 30 phút; danh sách + bảng chi tiết, nguyên nhân chính,
-  ô quyết định của chuyên viên (Xác nhận gian lận / Báo động giả / Cần thêm thông tin), giao dịch trong hồ sơ, thói quen
-  của khách, sơ đồ khách – thiết bị – merchant, nhật ký quyết định.
-- **Kiểm định**: kết quả theo nhóm gian lận, ma trận nhầm lẫn, hiệu quả từng luật, phân tích lỗi, so sánh cấu hình,
-  thanh kéo ngưỡng, công bằng.
-- **Dữ liệu & Chạy mô hình**: tải Data Pack, kiểm tra dữ liệu, chạy mô hình, tải kết quả, xoá kết luận đã ghi.
-- "Đã xử lý" = có kết luận: nhãn đã xác minh trong Data Pack hoặc quyết định chuyên viên lưu trong app (SQLite trên
-  máy chủ – còn đến khi app khởi động lại).
+## Ứng dụng có gì (6 màn hình)
+
+- **Hàng đợi của tôi** (trang mở đầu): 4 chip lọc nhanh (Khẩn cấp chưa xử lý · Thiết bị dùng chung R7 · Xác thực thêm
+  tại merchant HIGH · Nghi vấn mẫu mới), danh sách hồ sơ có cột SLA (CRITICAL 5 phút, HIGH 2 giờ), xử lý hàng loạt
+  các hồ sơ cùng loại rủi ro (có hộp xác nhận), ô quyết định, nút tác vụ **mô phỏng** (tạm khóa thiết bị, yêu cầu
+  sinh trắc học, gửi thông báo), sơ đồ liên kết đa khách hàng, nhật ký quyết định và tác vụ.
+- **Luồng thời gian thực**: mô hình học trên tháng 1–4, phát lần lượt giao dịch tháng 5–6 (1–50 giao dịch/giây),
+  chấm từng giao dịch bằng bảng trạng thái trong bộ nhớ, hàng đợi trực tiếp có đồng hồ SLA, đối chiếu đáp án BTC,
+  nút **Kiểm tra trùng khớp lô – luồng** trên toàn bộ 8.000 giao dịch.
+- **Tổng quan**: số giao dịch tạm dừng / xác thực thêm, bộ 4 chỉ số Recall, phân bố mức rủi ro, xu hướng, tiến độ.
+- **Giao dịch**: lọc, tìm kiếm, **bộ lọc nâng cao** (theo từng luật, khoảng tiền, bội số tiền, khung giờ, IP, số chiều
+  lệch thói quen), chi tiết điểm từng lớp và hành động tự động.
+- **Kiểm định**: tổng quan, 3 tầng hành động, kiểu gian lận mới (ẩn từng kiểu), thời gian thực, hiệu quả từng luật,
+  phân tích lỗi, so sánh cấu hình, độ nhạy ngưỡng, công bằng.
+- **Dữ liệu & Quản trị**: tải Data Pack, kiểm tra dữ liệu, chạy mô hình, tải kết quả, **học lại có kiểm soát** (so sánh
+  trước – sau trên giai đoạn kiểm tra độc lập, áp dụng, khôi phục bản cũ), xoá kết luận đã ghi.
 
 ## Cấu trúc
 
 ```
 streamlit_app.py        giao diện (tệp chính khi deploy)
-fraud_core.py           lõi mô hình: hồ sơ hành vi + Rule + Logistic Regression + Isolation Forest
+fraud_core.py           lõi mô hình: hồ sơ hành vi + Rule + Logistic Regression + Isolation Forest, 3 tầng hành động,
+                        thí nghiệm ẩn từng kiểu, học lại có kiểm soát
+fs_realtime.py          chấm điểm thời gian thực: bảng trạng thái trong bộ nhớ, Isolation Forest dạng mảng numpy,
+                        kiểm tra trùng khớp lô – luồng
 model/pretrained.json   mô hình học sẵn, dùng khi Data Pack tải lên không có nhãn
 data/                   Data Pack BTC (9 tệp CSV) cho nút "Chạy với Data Pack BTC"
 .streamlit/config.toml  màu sắc, font, giới hạn tải lên 100 MB  ← BẮT BUỘC phải có trên GitHub
