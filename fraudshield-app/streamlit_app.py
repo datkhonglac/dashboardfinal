@@ -145,7 +145,7 @@ box-shadow:0 1px 2px rgba(15,23,42,.04)}
 .fs-k .l{font-size:13px;color:#475467;display:flex;align-items:center;gap:7px;margin-top:6px;font-weight:500}
 .fs-k .l i{width:8px;height:8px;border-radius:50%;background:var(--c);flex:none}
 .fs-k .s{font-size:12px;color:var(--muted);margin-top:6px;line-height:1.45}
-.fs-k .tag{position:absolute;right:14px;bottom:14px;background:var(--cbg);color:var(--c);font-size:11.5px;font-weight:700;
+.fs-k .tag{position:absolute;right:14px;top:14px;background:var(--cbg);color:var(--c);font-size:11.5px;font-weight:700;
 padding:2px 9px;border-radius:999px}
 .fs-k::before{content:"";position:absolute;left:0;top:14px;bottom:14px;width:4px;border-radius:0 4px 4px 0;background:var(--c)}
 /* ---------- huy hiệu ---------- */
